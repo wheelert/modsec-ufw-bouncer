@@ -1,0 +1,29 @@
+[Unit]
+Description=UFW IP blocker for ModSecurity failures
+Documentation=man:ufw(8)
+Wants=network-online.target
+After=network-online.target ufw.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/modsec-ufw-bouncer.py --config /etc/modsec-ufw-bouncer.conf
+WorkingDirectory=/var/lib/modsec-ufw-bouncer
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+# UFW must be run with root privileges; this unit intentionally does not use User=.
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/var/lib/modsec-ufw-bouncer
+
+[Install]
+WantedBy=multi-user.target
