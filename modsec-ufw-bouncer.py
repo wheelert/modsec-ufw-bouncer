@@ -545,14 +545,18 @@ class Bouncer:
         if not dry_run:
             self.remove_expired()
         while True:
-            trigger_ip, trigger_rule_id, hits = self.find_trigger()
-            if trigger_ip is None:
+            trigger = self.find_trigger()
+            if trigger is None:
                 break
+            trigger_ip, trigger_rule_id, hits = trigger
             threshold, window, duration = self.settings.get_rule_policy(trigger_rule_id)
             if dry_run:
                 LOG.info("DRY RUN would block ip=%s rule=%s hits=%d within=%ds duration=%ds",
                          trigger_ip, trigger_rule_id, hits, window, duration)
+                # Clear this rule in the in-memory dry-run state so one pass ends.
                 self.state["events"][trigger_ip].pop(trigger_rule_id, None)
+                if not self.state["events"][trigger_ip]:
+                    self.state["events"].pop(trigger_ip, None)
                 continue
             if not self.block_trigger(trigger_ip, trigger_rule_id, hits):
                 break
