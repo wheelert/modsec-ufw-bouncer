@@ -25,7 +25,7 @@ AUDIT_HEADER = re.compile(r"^--+(?:[^-\s]+)?-(?P<section>[A-Z])--\s*(?P<body>.*)
 CLIENT_RE = re.compile(r"""\[client(?:[-_ ]?ip)?[:=]?\s+"?(?P<ip>[0-9A-Fa-f:.]+)"?\]""", re.IGNORECASE)
 RULE_ID_RE = re.compile(r"""\[id\s+(?:"(?P<q1>[^"]+)"|'(?P<q2>[^']+)'|(?P<bare>[0-9A-Za-z_-]+))\s*\]""")
 UNIQUE_RE = re.compile(r"""\[unique(?:_id)?\s+(?:"(?P<q1>[^"]+)"|'(?P<q2>[^']+)'|(?P<bare>[0-9A-Za-z_.-]+))\s*\]""", re.IGNORECASE)
-TIMESTAMP_RE = re.compile(r"(?:\[)?(?P<ts>\d{2}/[A-Za-z]{3}/\d{4}(?::\d{2}){3}(?:\.\d{1,6})?(?:\s+(?:[+-]|--)\d{4})?)(?:\])?(?:\s+(?P<body>.*)|$)")
+TIMESTAMP_RE = re.compile(r"^\[[^\]]+\]\s*(?P<body>.*)$")
 ISO_KEYS = ("timestamp", "local_time", "localTime", "time", "epoch")
 IP_KEYS = ("remote_ip", "client_ip", "remote_addr", "src_ip", "source_ip", "ip")
 UNIQUE_KEYS = ("unique_id", "uniqueId", "transaction_id", "transactionId", "id")
@@ -200,34 +200,39 @@ def parse_audit_line(line: str, state: Dict[str, Any]) -> List[AuditEvent]:
         if body:
             return parse_audit_payload(body, state)
         return []
+
     if state.get("section") == "A":
         parse_audit_body(line, state)
         state["section"] = ""
         return []
+
     if state.get("section") in ("B", "F", "H"):
         return parse_audit_payload(line, state)
+
     if "modsecurity" in line.lower() or "mod_security" in line.lower():
         return parse_audit_payload(line, state)
+
     return []
 
 def parse_audit_body(line: str, state: Dict[str, Any]) -> None:
     """Extract timestamp and client IP from audit section A."""
     match = TIMESTAMP_RE.match(line)
+    body = match.group("body") if match else line
     if match:
-        state["timestamp"] = match.group("ts")
-        body = match.group("body") or ""
-    else:
-        timestamp = extract_leading_timestamp(line)
-        state["timestamp"] = timestamp or state.get("timestamp", "")
-        body = line
-    address = extract_client(body)
+        state["timestamp"] = match.group(0)
+    # Search for a bare IPv4/IPv6-looking field after the timestamp.
+    address = next(
+        (
+            field.strip('"[]')
+            for field in body.split()
+            if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9A-Fa-f]{0,4}:){1,7}[0-9A-Fa-f:.]{1,4}", field.strip('"[]'))
+            and is_ip(field.strip('"[]'))
+        ),
+        "",
+    )
     if not address:
-        address = next(
-            (field.strip('"[]') for field in body.split() if is_ip(field.strip('"[]'))),
-            "",
-        )
+        address = extract_client(line) or ""
     state["ip"] = address
-
 
 def parse_audit_payload(line: str, state: Dict[str, Any]) -> List[AuditEvent]:
     timestamp = extract_leading_timestamp(line) or state.get("timestamp", "")
@@ -237,8 +242,6 @@ def parse_audit_payload(line: str, state: Dict[str, Any]) -> List[AuditEvent]:
         AuditEvent(ip, rule_id, parse_timestamp(timestamp), unique_id)
         for rule_id in extract_rule_ids(line)
     ]
-
-
 
 def event_from_json(value: Any) -> List[AuditEvent]:
     if isinstance(value, list):
@@ -489,8 +492,11 @@ class Bouncer:
 
     def parse_logs(self) -> List[AuditEvent]:
         events: List[AuditEvent] = []
+        if self.read_from_start:
+            self.state["logs"] = {}
+            self.state["parsers"] = {}
+            self.state["read_from_start"] = True
         for path in self.settings.log_paths:
-            self.state["read_from_start"] = self.read_from_start
             events.extend(process_log(self.state, path))
         if events:
             LOG.info("Parsed %d ModSecurity event(s)", len(events))
@@ -556,7 +562,10 @@ class Bouncer:
             LOG.info("Removed expired UFW deny ip=%s", ip)
 
     def cycle(self, dry_run: bool = False) -> None:
-        self.store(self.parse_logs())
+        events = self.parse_logs()
+        stored = self.store(events)
+        if dry_run:
+            LOG.info("Parsed %d event(s); stored %d candidate(s)", len(events), len(stored))
         prune_events(self.state)
         if not dry_run:
             self.remove_expired()
