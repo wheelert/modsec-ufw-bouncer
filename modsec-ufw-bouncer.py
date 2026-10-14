@@ -175,7 +175,7 @@ def extract_unique_id(message: str) -> str:
     return match.group(1) if match else ""
 
 def parse_audit_line(line: str, state: Dict[str, Any]) -> List[AuditEvent]:
-    """Parse an Apache/ModSecurity audit or error-log line."""
+    """Parse one Apache/ModSecurity audit section or error-log line."""
     match = AUDIT_HEADER.match(line)
     if match:
         section = match.group("section")
@@ -187,7 +187,6 @@ def parse_audit_line(line: str, state: Dict[str, Any]) -> List[AuditEvent]:
             state["unique_id"] = ""
             if body:
                 parse_audit_body(body, state)
-                state["section"] = ""
             return []
         if section == "Z":
             state["section"] = ""
@@ -197,7 +196,7 @@ def parse_audit_line(line: str, state: Dict[str, Any]) -> List[AuditEvent]:
             return []
         state["section"] = section
         if body:
-            return parse_audit_payload(line, state)
+            return parse_audit_payload(body, state)
         return []
     if state.get("section") == "A":
         parse_audit_body(line, state)
@@ -210,6 +209,7 @@ def parse_audit_line(line: str, state: Dict[str, Any]) -> List[AuditEvent]:
     return []
 
 def parse_audit_body(line: str, state: Dict[str, Any]) -> None:
+    """Extract timestamp and client IP from audit section A."""
     match = TIMESTAMP_RE.match(line)
     if match:
         state["timestamp"] = match.group("ts")
@@ -220,16 +220,23 @@ def parse_audit_body(line: str, state: Dict[str, Any]) -> None:
         body = line
     address = extract_client(body)
     if not address:
-        address = next((field.strip('"[]') for field in body.split() if is_ip(field.strip('"[]'))), "")
+        address = next(
+            (field.strip('"[]') for field in body.split() if is_ip(field.strip('"[]'))),
+            "",
+        )
     state["ip"] = address
+
 
 def parse_audit_payload(line: str, state: Dict[str, Any]) -> List[AuditEvent]:
     timestamp = extract_leading_timestamp(line) or state.get("timestamp", "")
     unique_id = extract_unique_id(line) or state.get("unique_id", "")
     ip = extract_client(line) or state.get("ip", "")
-    state["section"] = ""
-    return [AuditEvent(ip, rule_id, parse_timestamp(timestamp), unique_id)
-            for rule_id in extract_rule_ids(line)]
+    return [
+        AuditEvent(ip, rule_id, parse_timestamp(timestamp), unique_id)
+        for rule_id in extract_rule_ids(line)
+    ]
+
+
 
 def event_from_json(value: Any) -> List[AuditEvent]:
     if isinstance(value, list):
@@ -293,7 +300,10 @@ def process_log(state: Dict[str, Any], path: str) -> List[AuditEvent]:
         offset = 0
     else:
         offset = min(int(entry.get("offset", 0)), info.st_size)
-    parser_state: Dict[str, Any] = {"ip": "", "timestamp": "", "unique_id": "", "section": ""}
+    parser_state: Dict[str, Any] = {
+        "ip": "", "timestamp": "", "unique_id": "", "section": ""
+    }
+    parser_state.update(state.setdefault("parsers", {}).get(path, {}))
     output: List[AuditEvent] = []
     complete_bytes = b""
     try:
@@ -333,6 +343,7 @@ def process_log(state: Dict[str, Any], path: str) -> List[AuditEvent]:
     except (OSError, PermissionError) as exc:
         LOG.error("Unable to read log %s: %s", path, exc)
         return output
+    state.setdefault("parsers", {})[path] = parser_state
     return output
 
 def is_allowed(settings: BouncerConfig, ip: str) -> bool:
@@ -357,6 +368,7 @@ def load_state(path: str) -> Dict[str, Any]:
     value.setdefault("logs", {})
     value.setdefault("events", {})
     value.setdefault("blocks", {})
+    value.setdefault("parsers", {})
     return value
 
 def save_state_atomic(path: str, state: Dict[str, Any]) -> None:
