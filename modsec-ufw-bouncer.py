@@ -295,6 +295,7 @@ def process_log(state: Dict[str, Any], path: str) -> List[AuditEvent]:
     if not stat.S_ISREG(info.st_mode):
         LOG.warning("Ignoring non-regular log path: %s", path)
         return []
+
     logs = state.setdefault("logs", {})
     entry = logs.get(path)
     offset = 0
@@ -305,50 +306,31 @@ def process_log(state: Dict[str, Any], path: str) -> List[AuditEvent]:
         offset = 0
     else:
         offset = min(int(entry.get("offset", 0)), info.st_size)
+
     parser_state: Dict[str, Any] = {
         "ip": "", "timestamp": "", "unique_id": "", "section": ""
     }
     parser_state.update(state.setdefault("parsers", {}).get(path, {}))
     output: List[AuditEvent] = []
-    complete_bytes = b""
+
     try:
         with open(path, "rb") as handle:
             handle.seek(offset)
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                complete_bytes += chunk
-                if len(complete_bytes) > LINE_LIMIT:
-                    LOG.warning("Log growth for %s exceeded buffer; truncating", path)
-                    complete_bytes = complete_bytes[-1024:]
-                    break
-            last_newline = complete_bytes.rfind(b"\n")
-            if last_newline < 0:
-                complete_bytes = b""
-            else:
-                complete_bytes = complete_bytes[: last_newline + 1]
-            start = 0
-            while start < len(complete_bytes):
-                end = complete_bytes.find(b"\n", start)
-                if end < 0:
-                    break
-                raw = complete_bytes[start:end].rstrip(b"\r")
-                line = raw.decode("utf-8", errors="replace").strip()
+            for raw_line in handle:
+                line = raw_line.decode("utf-8", errors="replace").strip()
                 if len(line) > LINE_LIMIT:
                     LOG.warning("Ignoring oversized log line in %s", path)
                 elif line.startswith("{") or line.startswith("["):
-                    for event in event_from_json(line):
-                        output.append(event)
+                    output.extend(event_from_json(line))
                 else:
                     output.extend(parse_audit_line(line, parser_state))
-                start = end + 1
-            offset += start
-            logs[path] = {"inode": info.st_ino, "offset": offset}
+                offset += len(raw_line)
+                # Persist progress as we parse so a huge log cannot buffer whole.
+                state.setdefault("parsers", {})[path] = parser_state
+                logs[path] = {"inode": info.st_ino, "offset": offset}
     except (OSError, PermissionError) as exc:
         LOG.error("Unable to read log %s: %s", path, exc)
-        return output
-    state.setdefault("parsers", {})[path] = parser_state
+
     return output
 
 def is_allowed(settings: BouncerConfig, ip: str) -> bool:
