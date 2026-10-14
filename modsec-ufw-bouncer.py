@@ -25,7 +25,7 @@ AUDIT_HEADER = re.compile(r"^--+(?:[^-\s]+)?-(?P<section>[A-Z])--\s*(?P<body>.*)
 CLIENT_RE = re.compile(r"""\[client(?:[-_ ]?ip)?[:=]?\s+"?(?P<ip>[0-9A-Fa-f:.]+)"?\]""", re.IGNORECASE)
 RULE_ID_RE = re.compile(r"""\[id\s+(?:"(?P<q1>[^"]+)"|'(?P<q2>[^']+)'|(?P<bare>[0-9A-Za-z_-]+))\s*\]""")
 UNIQUE_RE = re.compile(r"""\[unique(?:_id)?\s+(?:"(?P<q1>[^"]+)"|'(?P<q2>[^']+)'|(?P<bare>[0-9A-Za-z_.-]+))\s*\]""", re.IGNORECASE)
-TIMESTAMP_RE = re.compile(r"(?:\[)?(?P<ts>\d{2}/[A-Za-z]{3}/\d{4}(?::\d{2}){3}(?:\s+[+-]\d{4})?)(?:\])?(?:\s+(?P<body>.*)|$)")
+TIMESTAMP_RE = re.compile(r"(?:\[)?(?P<ts>\d{2}/[A-Za-z]{3}/\d{4}(?::\d{2}){3}(?:\.\d{1,6})?(?:\s+(?:[+-]|--)\d{4})?)(?:\])?(?:\s+(?P<body>.*)|$)")
 ISO_KEYS = ("timestamp", "local_time", "localTime", "time", "epoch")
 IP_KEYS = ("remote_ip", "client_ip", "remote_addr", "src_ip", "source_ip", "ip")
 UNIQUE_KEYS = ("unique_id", "uniqueId", "transaction_id", "transactionId", "id")
@@ -108,7 +108,7 @@ def parse_timestamp(value: str) -> float:
     if not value:
         return time.time()
     patterns = (
-        "%d/%b/%Y:%H:%M:%S %z", "%d/%b/%Y:%H:%M:%S",
+        "%d/%b/%Y:%H:%M:%S.%f %z", "%d/%b/%Y:%H:%M:%S %z", "%d/%b/%Y:%H:%M:%S",
         "%a %b %d %H:%M:%S %Y", "%a %b %d %H:%M:%S %z %Y",
         "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S.%f",
@@ -121,6 +121,8 @@ def parse_timestamp(value: str) -> float:
             return parsed.timestamp()
         except ValueError:
             continue
+    if value.endswith("Z") or " --" in value:
+        value = value.replace(" --", " -")
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     try:
@@ -294,7 +296,7 @@ def process_log(state: Dict[str, Any], path: str) -> List[AuditEvent]:
     entry = logs.get(path)
     offset = 0
     if entry is None:
-        offset = info.st_size
+        offset = 0 if state.get("read_from_start") else info.st_size
     elif entry.get("inode") != info.st_ino:
         LOG.info("Log file rotated; re-reading: %s", path)
         offset = 0
@@ -480,6 +482,7 @@ class Bouncer:
         self.settings = BouncerConfig(raw)
         self.state = load_state(self.settings.state_file)
         self.stop_requested = False
+        self.read_from_start = False
 
     def stop(self, *_args: Any) -> None:
         self.stop_requested = True
@@ -487,6 +490,7 @@ class Bouncer:
     def parse_logs(self) -> List[AuditEvent]:
         events: List[AuditEvent] = []
         for path in self.settings.log_paths:
+            self.state["read_from_start"] = self.read_from_start
             events.extend(process_log(self.state, path))
         if events:
             LOG.info("Parsed %d ModSecurity event(s)", len(events))
@@ -597,6 +601,7 @@ def main() -> int:
     parser.add_argument("-c", "--config", default="/etc/modsec-ufw-bouncer.conf")
     parser.add_argument("--once", action="store_true", help="read logs once, then exit")
     parser.add_argument("--dry-run", action="store_true", help="read logs once and print decisions without changing UFW or state")
+    parser.add_argument("--read-from-start", action="store_true", help="read existing logs from file start during this run")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="increase logging")
     args = parser.parse_args()
     setup_logging(args.verbose)
@@ -604,6 +609,7 @@ def main() -> int:
         args.once = True
     try:
         bouncer = Bouncer(args.config)
+        bouncer.read_from_start = getattr(args, "read_from_start", False)
         signal.signal(signal.SIGINT, bouncer.stop)
         signal.signal(signal.SIGTERM, bouncer.stop)
         bouncer.run(once=args.once, dry_run=args.dry_run)
